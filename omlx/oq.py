@@ -42,6 +42,9 @@ OQ_DTYPES: tuple[str, ...] = ("bfloat16", "float16")
 
 _OQ_DEFAULT_GROUP_SIZE = 64
 
+_GLM_INDEXER_Q8 = {"bits": 8, "group_size": 64, "mode": "affine"}
+_GLM_INDEXER_PROJECTIONS = ("wq_b", "wk", "weights_proj")
+
 _MAX_MODEL_RAM_FRACTION = 0.8
 
 # Auto-built proxy for sensitivity measurement when the source model
@@ -92,6 +95,8 @@ _OQ_BPW_TARGETS: dict[float, tuple[float, float]] = {
 _ROUTED_LAYER_BOOST_LEVELS = {2.5, 2.7}
 _VALID_QUANT_BITS = (2, 3, 4, 5, 6, 8)
 
+_NATIVE_FLOAT8_QUANT_METHODS = frozenset(("fp8", "mxfp8"))
+
 
 def _bpw_targets_for_level(oq_level: float) -> tuple[float, float] | None:
     """Return (target_bpw, hard_cap_bpw) for the given oQ level, or None."""
@@ -117,6 +122,17 @@ def _validate_oq_dtype_for_model(config: dict, dtype: str) -> None:
             "DeepSeek V4 fp16 oQ can collapse to repeated BOS tokens during "
             "generation; use dtype='bfloat16' instead."
         )
+
+
+def _uses_quantized_source_sensitivity(config: dict) -> bool:
+    """Return whether source sensitivity must perturb quantized modules."""
+    quantization_config = config.get("quantization_config") or {}
+    if not isinstance(quantization_config, dict):
+        return False
+    quant_method = str(quantization_config.get("quant_method", "")).lower()
+    if quant_method == "mxfp8":
+        return True
+    return quant_method == "fp8" and _is_deepseek_v4_config(config)
 
 
 @dataclass
@@ -145,6 +161,25 @@ class OQImatrixData:
     metadata: dict[str, Any]
     path: str
     reused: bool = False
+
+
+def _glm_indexer_q8_override(path: str, config: dict) -> dict | None:
+    """Return the mandatory Q8 spec for GLM DSA indexer projections.
+
+    The GLM sparse-attention indexer decides which tokens survive top-k
+    selection. Its three projections are tiny relative to the full MoE model,
+    so spending mixed-precision budget below Q8 buys negligible size savings
+    while making the saved checkpoint incompatible with the fused Q8 loader.
+    Keep backbone and preserved-MTP indexers on the same explicit format.
+    """
+    if config.get("model_type") != "glm_moe_dsa":
+        return None
+    path = _normalize_quant_path(path)
+    if ".self_attn.indexer." not in path:
+        return None
+    if not path.endswith(tuple(f".{name}" for name in _GLM_INDEXER_PROJECTIONS)):
+        return None
+    return dict(_GLM_INDEXER_Q8)
 
 
 def universal_quant_predicate(
@@ -181,6 +216,10 @@ def universal_quant_predicate(
     non_quantizable = config.get("_oq_non_quantizable", set())
     if path in non_quantizable:
         return False
+
+    glm_indexer_override = _glm_indexer_q8_override(path, config)
+    if glm_indexer_override is not None:
+        return glm_indexer_override
 
     tc = config.get("text_config", {})
     num_layers = config.get("num_hidden_layers") or tc.get("num_hidden_layers", 32)
@@ -689,6 +728,16 @@ def _build_quant_plan(
     boost_map: dict[str, dict] = {}
     fixed_overrides = fixed_overrides or {}
 
+    # GLM DSA indexers are a format invariant, not an optional sensitivity
+    # boost. Seed them before pricing the plan and never let the bpw cap drop
+    # them. On GLM-5.2 all 22 indexers together are only about 209 MiB at Q8.
+    for path in named_shapes:
+        if path in fixed_overrides:
+            continue
+        override = _glm_indexer_q8_override(path, config)
+        if override is not None:
+            boost_map[path] = override
+
     layer_scores = config.get("_oq_sensitivity_map") or {}
     max_layer_score = max(layer_scores.values(), default=0.0)
 
@@ -707,7 +756,7 @@ def _build_quant_plan(
         base_bits,
         base_group_size,
         base_mode,
-        overrides=fixed_overrides,
+        overrides={**fixed_overrides, **boost_map},
     )
     total_bits_f = current_bpw * total_params
 
@@ -2105,8 +2154,9 @@ def validate_quantizable(config: dict) -> bool:
 
     Models with 'quantization' key (mlx-lm quantized) are excluded.
     Models with 'quantization_config' are excluded UNLESS they are native FP8
-    (e.g. MiniMax, DeepSeek) which are full-precision models stored in FP8 format,
-    or QAT-trained models (e.g. Google Gemma 4 QAT variants) whose
+    or MXFP8 (e.g. MiniMax, DeepSeek) source models whose floating-point
+    weights can be reconstructed from their block scales, or QAT-trained models
+    (e.g. Google Gemma 4 QAT variants) whose
     quantization_config records training-time settings but whose weights are
     stored in full precision (bfloat16/float16).
     """
@@ -2115,9 +2165,11 @@ def validate_quantizable(config: dict) -> bool:
     if "quantization_config" in config:
         qc = config["quantization_config"]
         if isinstance(qc, dict):
-            quant_method = qc.get("quant_method", "")
-            # FP8 models are full-precision weights stored in FP8 format
-            if quant_method == "fp8":
+            quant_method = str(qc.get("quant_method", "")).lower()
+            # Native FP8/MXFP8 sources retain floating-point weight semantics.
+            # _LazyTensorIndex reconstructs them from weight+scale pairs before
+            # applying the requested oQ/oQe format.
+            if quant_method in _NATIVE_FLOAT8_QUANT_METHODS:
                 return True
             # compressed-tensors float-quantized (e.g. Laguna FP8) is the same
             # situation with a different container: fp8 weights + block scales
@@ -4236,17 +4288,13 @@ def quantize_oq_streaming(
             )
         elif (
             not _model_exceeds_ram
-            and str(config.get("model_type", "")).startswith("deepseek_v4")
-            and isinstance(config.get("quantization_config"), dict)
-            and config["quantization_config"].get("quant_method") == "fp8"
+            and _uses_quantized_source_sensitivity(config)
         ):
-            # Native-fp8 source (e.g. DeepSeek-V4-Flash): the checkpoint
-            # loads as a quantized model (mxfp4 experts / mxfp8 attention),
-            # so the raw qdq measurement would only perturb the few float
-            # Linears. Measure on the source itself with the re-quantization
-            # perturbation instead.
+            # Native FP8/MXFP8 sources load as quantized modules. The raw QDQ
+            # measurement only perturbs float Linears, so measure on the source
+            # itself with the re-quantization perturbation instead.
             logger.info(
-                f"oQ{oq_level:g}: pre-quantized fp8 source, measuring "
+                f"oQ{oq_level:g}: pre-quantized FP8/MXFP8 source, measuring "
                 "sensitivity on source"
             )
             sensitivity_map = _measure_sensitivity_from_quantized_model(

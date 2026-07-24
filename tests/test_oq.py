@@ -245,6 +245,36 @@ class TestUniversalQuantPredicate:
         assert isinstance(result, dict)
         assert result["bits"] == 6
 
+    @pytest.mark.parametrize(
+        "path",
+        [
+            "model.layers.0.self_attn.indexer.wq_b",
+            "model.layers.0.self_attn.indexer.wk.weight",
+            "model.layers.0.self_attn.indexer.weights_proj",
+            "mtp.0.block.self_attn.indexer.wq_b.weight",
+            "mtp.0.block.self_attn.indexer.wk",
+            "mtp.0.block.self_attn.indexer.weights_proj.weight",
+        ],
+    )
+    def test_glm_dsa_indexer_is_mandatory_q8(self, path, module):
+        config = {
+            "model_type": "glm_moe_dsa",
+            "_oq_use_budget_plan": True,
+            "_oq_boost_map": {path.removesuffix(".weight"): {"bits": 5}},
+        }
+        result = universal_quant_predicate(path, module, config, 3.5)
+        assert result == {"bits": 8, "group_size": 64, "mode": "affine"}
+
+    @pytest.mark.parametrize("model_type", ["deepseek_v32", "deepseek_v4"])
+    def test_glm_dsa_indexer_q8_rule_does_not_touch_deepseek(self, model_type, module):
+        result = universal_quant_predicate(
+            "model.layers.0.self_attn.indexer.wq_b",
+            module,
+            {"model_type": model_type},
+            3.5,
+        )
+        assert result is True
+
     def test_dense_o_proj_5bit(self, dense_config, module):
         result = universal_quant_predicate(
             "model.layers.5.self_attn.o_proj", module, dense_config
@@ -766,6 +796,41 @@ class TestValidateQuantizable:
             is True
         )
 
+    def test_mxfp8_native_is_quantizable(self):
+        # MiniMax M3 publishes reconstructable FP8 weights under this method.
+        assert (
+            validate_quantizable({"quantization_config": {"quant_method": "mxfp8"}})
+            is True
+        )
+
+    def test_quantized_sensitivity_routing_preserves_glm_fp8_dequant(self):
+        from omlx.oq import _uses_quantized_source_sensitivity
+
+        assert (
+            _uses_quantized_source_sensitivity(
+                {"quantization_config": {"quant_method": "mxfp8"}}
+            )
+            is True
+        )
+        assert (
+            _uses_quantized_source_sensitivity(
+                {
+                    "model_type": "deepseek_v4",
+                    "quantization_config": {"quant_method": "fp8"},
+                }
+            )
+            is True
+        )
+        assert (
+            _uses_quantized_source_sensitivity(
+                {
+                    "model_type": "glm_moe_dsa",
+                    "quantization_config": {"quant_method": "fp8"},
+                }
+            )
+            is False
+        )
+
     def test_compressed_tensors_float_quantized_is_quantizable(self):
         # Laguna-style FP8: fp8 weights + block scales the lazy index dequants
         assert (
@@ -1074,6 +1139,38 @@ class TestLevelBudgetPlan:
         boost = plan.boost_map.get("model.layers.0.mlp.switch_mlp.down_proj")
         assert boost is not None
         assert boost["bits"] == 4
+
+    def test_glm_dsa_indexer_q8_is_seeded_outside_budget_cap(self):
+        paths = [
+            "model.layers.0.self_attn.indexer.wq_b",
+            "model.layers.0.self_attn.indexer.wk",
+            "model.layers.0.self_attn.indexer.weights_proj",
+            "mtp.0.block.self_attn.indexer.wq_b",
+            "mtp.0.block.self_attn.indexer.wk",
+            "mtp.0.block.self_attn.indexer.weights_proj",
+        ]
+        named_shapes = {path: (64, 64) for path in paths}
+        named_shapes["model.layers.0.mlp.switch_mlp.gate_proj"] = (8, 64, 64)
+        config = {
+            "model_type": "glm_moe_dsa",
+            "num_hidden_layers": 1,
+            "num_experts": 8,
+            "_oq_use_budget_plan": True,
+            "_oq_sensitivity_map": {"0": 0.0},
+        }
+        plan = _build_quant_plan(
+            named_shapes,
+            config,
+            3.5,
+            target_bpw=3.01,
+            hard_cap_bpw=3.02,
+        )
+        for path in paths:
+            assert plan.boost_map[path] == {
+                "bits": 8,
+                "group_size": 64,
+                "mode": "affine",
+            }
 
     def test_oq35_predicate_floor_for_expert_down_proj(self):
         """The non-budget predicate floor mirrors the oQ3.5 mandatory boost."""
@@ -3288,6 +3385,88 @@ class TestQuantizeOqStreamingFp8:
         assert (out / "config.json").exists()
         out_shards = list(out.glob("*.safetensors"))
         assert len(out_shards) > 0
+
+    def test_minimax_mxfp8_scale_inv_source_produces_output(self, tmp_path):
+        """MiniMax's F8_E4M3 + U8 weight_scale_inv layout quantizes."""
+        src = tmp_path / "src"
+        src.mkdir()
+        hidden = 64
+        raw_weight = np.random.randint(0, 255, (hidden, hidden), dtype=np.uint8)
+        exponent_scales = np.full((hidden, hidden // 32), 127, dtype=np.uint8)
+        _write_safetensors(
+            str(src / "model.safetensors"),
+            {
+                "model.embed_tokens.weight": np.ones((256, hidden), dtype=np.float16),
+                "model.layers.0.input_layernorm.weight": np.ones(
+                    hidden, dtype=np.float16
+                ),
+                "model.layers.0.self_attn.q_proj.weight": (
+                    raw_weight.tobytes(),
+                    [hidden, hidden],
+                    "F8_E4M3",
+                ),
+                "model.layers.0.self_attn.q_proj.weight_scale_inv": (
+                    exponent_scales.tobytes(),
+                    [hidden, hidden // 32],
+                    "U8",
+                ),
+                "lm_head.weight": np.ones((256, hidden), dtype=np.float16),
+            },
+        )
+        (src / "config.json").write_text(
+            json.dumps(
+                {
+                    "architectures": ["TestModelForCausalLM"],
+                    "model_type": "test_fp8",
+                    "num_hidden_layers": 1,
+                    "hidden_size": hidden,
+                    "vocab_size": 256,
+                    "quantization_config": {
+                        "quant_method": "mxfp8",
+                        "weight_block_size": [1, 32],
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+        out = tmp_path / "out"
+
+        quantize_oq_streaming(str(src), str(out), oq_level=4)
+
+        from safetensors import safe_open
+
+        out_keys = set()
+        for shard in out.glob("*.safetensors"):
+            with safe_open(str(shard), framework="numpy") as handle:
+                out_keys.update(handle.keys())
+        assert "model.layers.0.self_attn.q_proj.scales" in out_keys
+        assert not any(key.endswith("weight_scale_inv") for key in out_keys)
+
+    def test_mxfp8_source_uses_quantized_sensitivity_path(self, tmp_path, monkeypatch):
+        from omlx import oq as oq_module
+
+        src = tmp_path / "src"
+        src.mkdir()
+        _make_fp8_model(src, n_layers=1, hidden=64, fp8_convention="mxfp")
+        config = json.loads((src / "config.json").read_text(encoding="utf-8"))
+        config["quantization_config"] = {"quant_method": "mxfp8"}
+        (src / "config.json").write_text(json.dumps(config), encoding="utf-8")
+
+        standard_measure = MagicMock(
+            side_effect=AssertionError("raw QDQ sensitivity path used")
+        )
+        quantized_measure = MagicMock(return_value={0: 0.1})
+        monkeypatch.setattr(oq_module, "_measure_sensitivity", standard_measure)
+        monkeypatch.setattr(
+            oq_module,
+            "_measure_sensitivity_from_quantized_model",
+            quantized_measure,
+        )
+
+        quantize_oq_streaming(str(src), str(tmp_path / "out"), oq_level=4)
+
+        standard_measure.assert_not_called()
+        quantized_measure.assert_called_once()
 
     def test_no_scale_keys_in_output(self, tmp_path):
         """Scale keys are consumed by dequant, never written to output."""
