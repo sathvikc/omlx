@@ -1115,7 +1115,7 @@ class TestProcessChatMessages:
     def test_text_only_uses_vlm_prepare_path(self, mock_extract):
         """Text-only turns on a VLM model still use _prepare_vision_inputs()."""
         text_msgs = [{"role": "user", "content": "Hello"}]
-        mock_extract.return_value = (text_msgs, [], [], [])
+        mock_extract.return_value = (text_msgs, [], [])
 
         engine = _make_loaded_engine()
         engine._prepare_vision_inputs = MagicMock(
@@ -1143,7 +1143,6 @@ class TestProcessChatMessages:
             text_msgs,
             [],
             audio=None,
-            videos=None,
             chat_template_kwargs=None,
             tools=None,
             is_partial=None,
@@ -1153,7 +1152,7 @@ class TestProcessChatMessages:
     def test_text_only_passes_tools_to_prepare_vision(self, mock_extract):
         """Text-only + tools still convert and pass tools through VLM path."""
         text_msgs = [{"role": "user", "content": "Hello"}]
-        mock_extract.return_value = (text_msgs, [], [], [])
+        mock_extract.return_value = (text_msgs, [], [])
 
         engine = _make_loaded_engine()
         engine._prepare_vision_inputs = MagicMock(
@@ -1178,7 +1177,7 @@ class TestProcessChatMessages:
 
         mock_image = Image.new("RGB", (4, 4), "red")
         text_msgs = [{"role": "user", "content": "Describe"}]
-        mock_extract.return_value = (text_msgs, [mock_image], [], [])
+        mock_extract.return_value = (text_msgs, [mock_image], [])
 
         engine = _make_loaded_engine()
         engine._apply_ocr_prompt = MagicMock(return_value=text_msgs)
@@ -1222,7 +1221,7 @@ class TestProcessChatMessages:
 
         mock_image = Image.new("RGB", (4, 4), "red")
         text_msgs = [{"role": "user", "content": "Describe"}]
-        mock_extract.return_value = (text_msgs, [mock_image], [], [])
+        mock_extract.return_value = (text_msgs, [mock_image], [])
 
         engine = _make_loaded_engine()
         engine._apply_ocr_prompt = MagicMock(return_value=text_msgs)
@@ -1251,7 +1250,7 @@ class TestProcessChatMessages:
 
         mock_image = Image.new("RGB", (4, 4), "red")
         text_msgs = [{"role": "user", "content": "Describe"}]
-        mock_extract.return_value = (text_msgs, [mock_image], [], [])
+        mock_extract.return_value = (text_msgs, [mock_image], [])
 
         engine = _make_loaded_engine()
         engine._apply_ocr_prompt = MagicMock(return_value=text_msgs)
@@ -1264,41 +1263,6 @@ class TestProcessChatMessages:
 
         call_kwargs = engine._prepare_vision_inputs.call_args[1]
         assert call_kwargs["tools"] is None
-
-    @patch("omlx.engine.vlm.extract_images_from_messages")
-    def test_video_path_preserves_media_message_and_frames(self, mock_extract):
-        messages = [
-            {
-                "role": "user",
-                "content": [
-                    {"type": "text", "text": "Describe"},
-                    {
-                        "type": "video_url",
-                        "video_url": {"url": "data:video/mp4;base64,AAAA"},
-                    },
-                ],
-            }
-        ]
-        text_msgs = [{"role": "user", "content": "Describe"}]
-        frames = MagicMock(name="video_frames")
-        mock_extract.return_value = (text_msgs, [], [], [frames])
-
-        engine = _make_loaded_engine(model_type="qwen4_exp")
-        engine._prepare_vision_inputs = MagicMock(
-            return_value=([1, 2, 3], None, None, None, 0, [])
-        )
-        engine._process_chat_messages(messages, tools=None, kwargs={})
-
-        engine._prepare_vision_inputs.assert_called_once_with(
-            messages,
-            [],
-            audio=None,
-            videos=[frames],
-            chat_template_kwargs=None,
-            tools=None,
-            is_partial=None,
-        )
-
 
 # ---------------------------------------------------------------------------
 # TestPrepareVisionInputs
@@ -1638,6 +1602,58 @@ class TestFormatMessagesForVLMTemplate:
         # User message with image should be list
         assert isinstance(formatted[1]["content"], list)
         assert self._count_image_placeholders([formatted[1]]) == 1
+
+    def test_glm5_next_preserves_image_parts_for_native_template(self):
+        """GLM-5.3 image parts must survive mlx-vlm's generic fallback."""
+        engine = _make_loaded_engine(model_type="glm5_next")
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "Before"},
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": "data:image/png;base64,abc"},
+                    },
+                    {"type": "text", "text": "After"},
+                ],
+            }
+        ]
+
+        formatted, image_ranges = engine._format_messages_for_vlm_template(
+            messages, num_images=1
+        )
+
+        assert formatted == [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "Before"},
+                    {"type": "image"},
+                    {"type": "text", "text": "After"},
+                ],
+            }
+        ]
+        assert image_ranges == [(0, 1)]
+
+    def test_glm5_next_inserts_fallback_image_marker(self):
+        """Legacy GLM callers with separate images still receive a marker."""
+        engine = _make_loaded_engine(model_type="glm5_next")
+
+        formatted, image_ranges = engine._format_messages_for_vlm_template(
+            [{"role": "user", "content": "Describe this"}], num_images=1
+        )
+
+        assert formatted == [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "image"},
+                    {"type": "text", "text": "Describe this"},
+                ],
+            }
+        ]
+        assert image_ranges == [(0, 1)]
 
     def test_reasoning_content_preserved_verbatim(self):
         """Assistant messages with reasoning_content must skip get_message_json.
